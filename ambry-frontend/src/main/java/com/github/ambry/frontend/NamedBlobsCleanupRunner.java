@@ -65,6 +65,7 @@ public class NamedBlobsCleanupRunner implements Runnable {
   private final String smallestASCII = "\0";
   private final int containerDelaySeconds;
   private final Set<String> excludedContainers;
+  private final Set<String> excludedAccounts;
   private final Time time;
   /**
    * Per-container resume cursor keyed by "{accountId}_{containerId}", retained in memory across scheduled runs so a
@@ -78,6 +79,11 @@ public class NamedBlobsCleanupRunner implements Runnable {
   private final Counter containerCleanupFailedCount;
   /** Increments each time a stale-blob page scan is killed by the DB long-transaction limit (full-size or shrunk). */
   private final Counter pageScanKilledCount;
+  /**
+   * Increments each time the runner skips past a single blob name whose stale-version scan cannot complete under the
+   * database time limit even at the shrunk page size, so the rest of the container can still be cleaned.
+   */
+  private final Counter blobNameSkippedCount;
 
   /**
    * Maximum number of attempts for a single stale-blob page scan before the container is deferred to the next
@@ -94,6 +100,14 @@ public class NamedBlobsCleanupRunner implements Runnable {
    * database time limit, and the cursor keeps moving forward through the container.
    */
   private static final int SHRUNK_PAGE_SIZE = 50;
+  /**
+   * Maximum number of blob names the runner skips past in one container in a single run when even the shrunk page scan
+   * is killed. Bounds the database load (each skip follows a killed scan) while still letting the rest of the container
+   * make progress; any remaining skips happen on later runs, which resume from the saved cursor.
+   */
+  private static final int MAX_BLOB_NAME_SKIPS_PER_RUN = 3;
+  /** Client-side wait for the cheap indexed lookup that finds the next blob name to skip to. */
+  private static final long GET_FIRST_BLOB_NAME_TIMEOUT_SECONDS = 30L;
 
   public NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService) {
     this(router, namedBlobDb, accountService, 0);
@@ -111,8 +125,15 @@ public class NamedBlobsCleanupRunner implements Runnable {
 
   public NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService,
       int containerDelaySeconds, Collection<String> excludedContainers, MetricRegistry metricRegistry) {
-    this(router, namedBlobDb, accountService, containerDelaySeconds, excludedContainers, SystemTime.getInstance(),
+    this(router, namedBlobDb, accountService, containerDelaySeconds, excludedContainers, Collections.emptySet(),
         metricRegistry);
+  }
+
+  public NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService,
+      int containerDelaySeconds, Collection<String> excludedContainers, Collection<String> excludedAccounts,
+      MetricRegistry metricRegistry) {
+    this(router, namedBlobDb, accountService, containerDelaySeconds, excludedContainers, excludedAccounts,
+        SystemTime.getInstance(), metricRegistry);
   }
 
   NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService,
@@ -122,11 +143,20 @@ public class NamedBlobsCleanupRunner implements Runnable {
 
   NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService,
       int containerDelaySeconds, Collection<String> excludedContainers, Time time) {
-    this(router, namedBlobDb, accountService, containerDelaySeconds, excludedContainers, time, new MetricRegistry());
+    this(router, namedBlobDb, accountService, containerDelaySeconds, excludedContainers, Collections.emptySet(), time,
+        new MetricRegistry());
   }
 
   NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService,
-      int containerDelaySeconds, Collection<String> excludedContainers, Time time, MetricRegistry metricRegistry) {
+      int containerDelaySeconds, Collection<String> excludedContainers, Collection<String> excludedAccounts,
+      Time time) {
+    this(router, namedBlobDb, accountService, containerDelaySeconds, excludedContainers, excludedAccounts, time,
+        new MetricRegistry());
+  }
+
+  NamedBlobsCleanupRunner(Router router, NamedBlobDb namedBlobDb, AccountService accountService,
+      int containerDelaySeconds, Collection<String> excludedContainers, Collection<String> excludedAccounts, Time time,
+      MetricRegistry metricRegistry) {
     if (containerDelaySeconds < 0) {
       throw new IllegalArgumentException("containerDelaySeconds must not be negative");
     }
@@ -136,11 +166,14 @@ public class NamedBlobsCleanupRunner implements Runnable {
     this.containerDelaySeconds = containerDelaySeconds;
     this.excludedContainers =
         excludedContainers == null ? Collections.emptySet() : new HashSet<>(excludedContainers);
+    this.excludedAccounts = excludedAccounts == null ? Collections.emptySet() : new HashSet<>(excludedAccounts);
     this.time = time;
     this.containerCleanupFailedCount =
         metricRegistry.counter(MetricRegistry.name(NamedBlobsCleanupRunner.class, "ContainerFailedCount"));
     this.pageScanKilledCount =
         metricRegistry.counter(MetricRegistry.name(NamedBlobsCleanupRunner.class, "PageScanKilledCount"));
+    this.blobNameSkippedCount =
+        metricRegistry.counter(MetricRegistry.name(NamedBlobsCleanupRunner.class, "BlobNameSkippedCount"));
     String cursorMapSizeGauge = MetricRegistry.name(NamedBlobsCleanupRunner.class, "CursorMapSize");
     metricRegistry.remove(cursorMapSizeGauge);
     metricRegistry.register(cursorMapSizeGauge, (Gauge<Integer>) containerCleanupCursors::size);
@@ -228,22 +261,43 @@ public class NamedBlobsCleanupRunner implements Runnable {
       logger.info("Resuming cleanup of container {} from a saved cursor after a previous deferral", container.getId());
     }
     int pageSize = 0;  // 0 means the database default (full-size) page.
+    int blobNameSkips = 0;
     NamedBlobDb.StaleBlobsWithLatestBlobName staleBlobsWithLatestBlobName;
     do {
       try {
         staleBlobsWithLatestBlobName = pullStaleBlobsResilient(container, blobName, pageSize);
       } catch (PageKilledException e) {
-        if (pageSize != 0) {
-          // Already at the shrunk page size and still killed: cannot make progress on this container right now.
-          // Defer it; the next scheduled run resumes from this same cursor.
+        if (pageSize == 0) {
+          // First kill at full size: shrink and retry the same cursor so the scan reads fewer rows and the cursor can
+          // still move forward, rather than re-running the same heavy query (which only adds load).
+          pageSize = SHRUNK_PAGE_SIZE;
+          logger.warn("Stale-blob scan for container {} was killed at its cursor; shrinking the page to {} to make "
+              + "progress instead of retrying the same query", container.getId(), pageSize);
+          continue;
+        }
+        // Even the shrunk page was killed: the blob name at this cursor has too many live versions to scan under the
+        // database time limit. Skip past it with a cheap indexed lookup so the rest of the container is still cleaned;
+        // the skipped blob name is left to a targeted reap / TTL / version cap. Bound the skips per run so a broadly
+        // bloated container cannot spin on many killed scans in a single run.
+        if (blobNameSkips >= MAX_BLOB_NAME_SKIPS_PER_RUN) {
+          throw new IllegalStateException("Stale-blob scan for container " + container.getId()
+              + " was killed even at the shrunk page size; deferring after " + blobNameSkips + " skips this run", e);
+        }
+        String stuckBlobName =
+            namedBlobDb.getFirstBlobName(container, blobName).get(GET_FIRST_BLOB_NAME_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        if (stuckBlobName == null) {
+          // Nothing at or after the cursor to skip to: defer rather than drop the cursor, so the next run resumes here.
           throw new IllegalStateException(
               "Stale-blob scan for container " + container.getId() + " was killed even at the shrunk page size", e);
         }
-        // Shrink and retry the same cursor so the scan reads fewer rows and the cursor can still move forward,
-        // rather than re-running the same heavy query (which only adds load) or sitting on the page across runs.
-        pageSize = SHRUNK_PAGE_SIZE;
-        logger.warn("Stale-blob scan for container {} was killed at its cursor; shrinking the page to {} to make "
-            + "progress instead of retrying the same query", container.getId(), pageSize);
+        blobName = stuckBlobName + smallestASCII;  // advance strictly past the stuck blob name
+        blobNameSkips++;
+        blobNameSkippedCount.inc();
+        pageSize = 0;  // resume full-size scanning for the region after the skipped blob name
+        containerCleanupCursors.put(cursorKey, blobName);
+        logger.warn("Stale-blob scan for container {} was killed even at the shrunk page size; skipping blob name {} "
+            + "(skip {} of {}) and resuming after it", container.getId(), stuckBlobName, blobNameSkips,
+            MAX_BLOB_NAME_SKIPS_PER_RUN);
         continue;
       }
       List<StaleNamedBlob> batchStaleBlobs = staleBlobsWithLatestBlobName.getStaleBlobs();
@@ -367,21 +421,25 @@ public class NamedBlobsCleanupRunner implements Runnable {
   }
 
   /**
-   * Determines whether the given container is excluded from the named blob stale data cleanup process. Matching is by
-   * fully-qualified {@code "accountName/containerName"}. When the account cannot be resolved the container is treated
-   * as not excluded, so an unresolvable account never silently suppresses cleanup across the fleet.
+   * Determines whether the given container is excluded from the named blob stale data cleanup process. A container is
+   * excluded if its parent account is listed in the account-level exclusions, or if its fully-qualified
+   * {@code "accountName/containerName"} is listed in the container-level exclusions. When the account cannot be
+   * resolved the container is treated as not excluded, so an unresolvable account never silently suppresses cleanup
+   * across the fleet.
    * @param container the {@link Container} being considered for cleanup.
    * @return {@code true} if the container should be skipped (its stale versions retained), {@code false} otherwise.
    */
   private boolean isExcludedFromCleanup(Container container) {
-    if (excludedContainers.isEmpty()) {
+    if (excludedAccounts.isEmpty() && excludedContainers.isEmpty()) {
       return false;
     }
     Account account = accountService.getAccountById(container.getParentAccountId());
     if (account == null) {
       return false;
     }
-    return excludedContainers.contains(account.getName() + "/" + container.getName());
+    String accountName = account.getName();
+    return excludedAccounts.contains(accountName) || excludedContainers.contains(
+        accountName + "/" + container.getName());
   }
 
   /**

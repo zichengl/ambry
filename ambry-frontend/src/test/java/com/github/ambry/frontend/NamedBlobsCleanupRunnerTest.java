@@ -156,6 +156,34 @@ public class NamedBlobsCleanupRunnerTest {
   }
 
   @Test
+  public void testKilledShrunkScanSkipsBloatedBlobNameAndContinues() {
+    // When even the shrunk page is killed, the runner looks up the offending blob name and skips past it, resuming
+    // after it so the rest of the container is still cleaned instead of making no progress at all.
+    Container container = mockContainer((short) 1, Container.NamedBlobMode.OPTIONAL, (short) 100, "container-a");
+    AccountService accountService = mock(AccountService.class);
+    when(accountService.getContainersByStatus(Container.ContainerStatus.ACTIVE)).thenReturn(
+        Collections.singleton(container));
+    when(accountService.getContainersByStatus(Container.ContainerStatus.INACTIVE)).thenReturn(Collections.emptySet());
+
+    NamedBlobDb namedBlobDb = mock(NamedBlobDb.class);
+    CompletableFuture<NamedBlobDb.StaleBlobsWithLatestBlobName> killedScan = new CompletableFuture<>();
+    killedScan.completeExceptionally(new SQLException("Query execution was interrupted", "70100", 1317));
+    // The blob name at the start of the container is fatally bloated: both the full and shrunk scans are killed.
+    when(namedBlobDb.pullStaleBlobs(eq(container), eq(FIRST_BLOB_NAME))).thenReturn(killedScan);
+    when(namedBlobDb.pullStaleBlobs(eq(container), eq(FIRST_BLOB_NAME), anyInt())).thenReturn(killedScan);
+    when(namedBlobDb.getFirstBlobName(eq(container), eq(FIRST_BLOB_NAME))).thenReturn(
+        CompletableFuture.completedFuture("bloated"));
+    // Everything after the skipped blob name scans cleanly and the container finishes.
+    when(namedBlobDb.pullStaleBlobs(eq(container), eq("bloated\u0000"))).thenReturn(CompletableFuture.completedFuture(
+        new NamedBlobDb.StaleBlobsWithLatestBlobName(Collections.emptyList(), null)));
+
+    new NamedBlobsCleanupRunner(mock(Router.class), namedBlobDb, accountService, 0, new MockTime()).run();
+
+    verify(namedBlobDb).getFirstBlobName(container, FIRST_BLOB_NAME);
+    verify(namedBlobDb).pullStaleBlobs(container, "bloated\u0000");
+  }
+
+  @Test
   public void testResumesFromSavedCursorAfterKill() {
     // On the first run the container's first page succeeds (cursor advances to "cursor1"), then the page at "cursor1"
     // is killed and the container is deferred. The second run must resume from "cursor1", not restart at "\0".
@@ -289,6 +317,34 @@ public class NamedBlobsCleanupRunnerTest {
         Utils.splitString("my account/my container", ","), new MockTime()).run();
 
     verify(namedBlobDb, never()).pullStaleBlobs(excludedContainer, FIRST_BLOB_NAME);
+  }
+
+  @Test
+  public void testExcludedAccountSkipsAllItsContainers() {
+    // An account-level exclusion skips every container under that account, while containers in other accounts are
+    // still cleaned.
+    Container excludedA = mockContainer((short) 1, Container.NamedBlobMode.OPTIONAL, (short) 100, "container-a");
+    Container excludedB = mockContainer((short) 2, Container.NamedBlobMode.OPTIONAL, (short) 100, "container-b");
+    Container otherAccountContainer =
+        mockContainer((short) 3, Container.NamedBlobMode.OPTIONAL, (short) 200, "container-c");
+    Account excludedAccount = mock(Account.class);
+    when(excludedAccount.getName()).thenReturn("account1");
+    Account otherAccount = mock(Account.class);
+    when(otherAccount.getName()).thenReturn("account2");
+    AccountService accountService = mock(AccountService.class);
+    when(accountService.getAccountById((short) 100)).thenReturn(excludedAccount);
+    when(accountService.getAccountById((short) 200)).thenReturn(otherAccount);
+    when(accountService.getContainersByStatus(Container.ContainerStatus.ACTIVE)).thenReturn(
+        new HashSet<>(Arrays.asList(excludedA, excludedB, otherAccountContainer)));
+    when(accountService.getContainersByStatus(Container.ContainerStatus.INACTIVE)).thenReturn(Collections.emptySet());
+    NamedBlobDb namedBlobDb = mockNamedBlobDb();
+
+    new NamedBlobsCleanupRunner(mock(Router.class), namedBlobDb, accountService, 0, Collections.emptySet(),
+        Collections.singleton("account1"), new MockTime()).run();
+
+    verify(namedBlobDb, never()).pullStaleBlobs(excludedA, FIRST_BLOB_NAME);
+    verify(namedBlobDb, never()).pullStaleBlobs(excludedB, FIRST_BLOB_NAME);
+    verify(namedBlobDb).pullStaleBlobs(otherAccountContainer, FIRST_BLOB_NAME);
   }
 
   private NamedBlobDb mockNamedBlobDb() {
